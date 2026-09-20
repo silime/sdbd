@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/random.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -468,9 +469,11 @@ struct sdbd_packet {
 
 struct sdbd_service {
     struct sdbd_ctx *sctx;
+    bfdev_list_head_t list;
     bfenv_eproc_timer_t timer;
     bfdev_array_t stream;
     int (*write)(struct sdbd_service *service, void *data, size_t length);
+    int (*okay)(struct sdbd_service *service);
     void (*close)(struct sdbd_service *service);
 
     uint32_t local;
@@ -485,10 +488,12 @@ struct sdbd_service_id {
 
 struct sdbd_shell_service {
     struct sdbd_service service;
+    bfenv_eproc_event_t child_ev;
     bfenv_eproc_event_t stdinout_ev;
     bfenv_eproc_event_t stderr_ev;
     pid_t pid;
 
+    int pidfd;
     int stdinout_fd;
     int stderr_fd;
 
@@ -502,6 +507,11 @@ struct sdbd_shell_service {
     enum shell_type type;
     enum shell_protocol protocol;
 
+    bool stdin_closed;
+    bool exited;
+    bool finishing;
+    unsigned int pending_writes;
+    int exit_status;
     bool v2;
     char *term;
 };
@@ -530,7 +540,7 @@ struct sdbd_tcp_service {
 
 struct sdbd_ctx {
     bfenv_eproc_t *eproc;
-    BFDEV_DECLARE_RADIX(services, struct sdbd_service *);
+    bfdev_list_head_t services;
     bfenv_iothread_t *usbio_in;
     bfenv_iothread_t *usbio_out;
 
@@ -1267,7 +1277,20 @@ service_release(struct sdbd_service *service)
 {
     bfdev_array_release(&service->stream);
     bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
-    bfdev_radix_free(&service->sctx->services, service->local);
+    bfdev_list_del(&service->list);
+}
+
+static struct sdbd_service *
+service_find(struct sdbd_ctx *sctx, uint32_t local)
+{
+    struct sdbd_service *service;
+
+    bfdev_list_for_each_entry(service, &sctx->services, list) {
+        if (service->local == local)
+            return service;
+    }
+
+    return NULL;
 }
 
 static int
@@ -1466,28 +1489,197 @@ shell_write(struct sdbd_shell_service *shell, const void *data, size_t size)
     return -BFDEV_ENOERR;
 }
 
+static int
+service_shell_stdin_close(struct sdbd_shell_service *shell)
+{
+    int retval;
+
+    if (shell->stdin_closed)
+        return -BFDEV_ENOERR;
+
+    if (shell->exited || shell->finishing || shell->stdinout_fd == -1) {
+        shell->stdin_closed = true;
+        return -BFDEV_ENOERR;
+    }
+
+    if (shell->type == SHELL_RAW)
+        retval = shutdown(shell->stdinout_fd, SHUT_WR);
+    else
+        retval = sdbd_write(shell->stdinout_fd, "\x04", 1);
+
+    if (bfdev_unlikely(retval < 0)) {
+        bfdev_log_warn("shell stdin close failed: %d\n", errno);
+        return -BFDEV_EIO;
+    }
+
+    shell->stdin_closed = true;
+    return -BFDEV_ENOERR;
+}
+
 static void
 service_shell_close(struct sdbd_service *service)
 {
     struct sdbd_shell_service *shell;
+    int status;
 
     bfdev_log_notice("shell close\n");
     shell = bfdev_container_of(service, struct sdbd_shell_service, service);
     send_close(shell->service.sctx, 0, shell->service.remote);
-    kill(shell->pid, SIGKILL);
+    if (!shell->exited) {
+        kill(shell->pid, SIGKILL);
+        while (waitpid(shell->pid, &status, 0) < 0 && errno == EINTR);
+        shell->exited = true;
+    }
+
+    if (shell->pidfd != -1) {
+        bfenv_eproc_event_remove(service->sctx->eproc, &shell->child_ev);
+        close(shell->pidfd);
+        shell->pidfd = -1;
+    }
 
     if (shell->stderr_fd != -1) {
         bfenv_eproc_event_remove(service->sctx->eproc, &shell->stderr_ev);
         close(shell->stderr_fd);
+        shell->stderr_fd = -1;
     }
 
-    bfenv_eproc_event_remove(service->sctx->eproc, &shell->stdinout_ev);
+    if (shell->stdinout_fd != -1) {
+        bfenv_eproc_event_remove(service->sctx->eproc, &shell->stdinout_ev);
+        close(shell->stdinout_fd);
+        shell->stdinout_fd = -1;
+    }
+
     bfdev_array_release(&shell->escape_buff);
     bfdev_free(NULL, shell->term);
-    close(shell->stdinout_fd);
 
     service_release(service);
     bfdev_free(NULL, shell);
+}
+
+static int
+service_shell_send_data(struct sdbd_shell_service *shell,
+                        const void *data, size_t size)
+{
+    int retval;
+
+    retval = send_data_async(shell->service.sctx, shell->service.local,
+        shell->service.remote, (void *)data, size);
+    if (bfdev_unlikely(retval < 0))
+        return retval;
+
+    shell->pending_writes++;
+    return -BFDEV_ENOERR;
+}
+
+static int
+service_shell_finish(struct sdbd_shell_service *shell)
+{
+    struct {
+        struct shell_data header;
+        uint8_t status;
+    } __bfdev_packed msg;
+    int retval;
+
+    if (!shell->exited || shell->stdinout_fd != -1 || shell->stderr_fd != -1)
+        return -BFDEV_ENOERR;
+
+    if (shell->finishing)
+        return -BFDEV_ENOERR;
+
+    if (shell->v2) {
+        msg.header.id = SHELL_CMD_EXIT;
+        msg.header.size = bfdev_cpu_to_le32(sizeof(msg.status));
+
+        if (WIFEXITED(shell->exit_status))
+            msg.status = WEXITSTATUS(shell->exit_status);
+        else if (WIFSIGNALED(shell->exit_status))
+            msg.status = 128 + WTERMSIG(shell->exit_status);
+        else
+            msg.status = 1;
+
+        retval = service_shell_send_data(shell, &msg, sizeof(msg));
+        if (bfdev_unlikely(retval < 0))
+            return retval;
+    }
+
+    shell->finishing = true;
+    if (!shell->pending_writes)
+        service_shell_close(&shell->service);
+
+    return -BFDEV_ENOERR;
+}
+
+static int
+service_shell_okay(struct sdbd_service *service)
+{
+    struct sdbd_shell_service *shell;
+
+    shell = bfdev_container_of(service, struct sdbd_shell_service, service);
+    if (bfdev_unlikely(!shell->pending_writes)) {
+        bfdev_log_warn("shell okay: no pending writes\n");
+        return -BFDEV_ENOERR;
+    }
+
+    shell->pending_writes--;
+    if (shell->finishing && !shell->pending_writes)
+        service_shell_close(service);
+
+    return -BFDEV_ENOERR;
+}
+
+static int
+service_shell_output_close(struct sdbd_shell_service *shell,
+                           bfenv_eproc_event_t *event)
+{
+    bfenv_eproc_event_remove(shell->service.sctx->eproc, event);
+    close(event->fd);
+
+    if (event == &shell->stderr_ev)
+        shell->stderr_fd = -1;
+    else
+        shell->stdinout_fd = -1;
+
+    return service_shell_finish(shell);
+}
+
+static int
+service_shell_child_handle(bfenv_eproc_event_t *event, void *pdata)
+{
+    struct sdbd_shell_service *shell;
+    pid_t pid;
+    int status;
+
+    shell = pdata;
+    do {
+        pid = waitpid(shell->pid, &status, 0);
+    } while (pid < 0 && errno == EINTR);
+
+    if (bfdev_unlikely(pid != shell->pid)) {
+        bfdev_log_err("shell child: waitpid failed %d\n", errno);
+        return -BFDEV_ECHILD;
+    }
+
+    bfenv_eproc_event_remove(shell->service.sctx->eproc, event);
+    close(shell->pidfd);
+    shell->pidfd = -1;
+    shell->exited = true;
+    shell->exit_status = status;
+
+    if (shell->stdinout_fd != -1) {
+        bfenv_eproc_error_set(&shell->stdinout_ev.events);
+        if (!shell->stdinout_ev.pending)
+            bfenv_eproc_event_raise(shell->service.sctx->eproc,
+                &shell->stdinout_ev);
+    }
+
+    if (shell->stderr_fd != -1) {
+        bfenv_eproc_error_set(&shell->stderr_ev.events);
+        if (!shell->stderr_ev.pending)
+            bfenv_eproc_event_raise(shell->service.sctx->eproc,
+                &shell->stderr_ev);
+    }
+
+    return service_shell_finish(shell);
 }
 
 static int
@@ -1517,6 +1709,12 @@ service_shell_write(struct sdbd_service *service, void *data, size_t length)
 
             switch (shell->cmd) {
                 case SHELL_CMD_STDIN:
+                    if (bfdev_unlikely(shell->stdin_closed)) {
+                        bfdev_log_warn("shell write: stdin already closed\n");
+                        service_shell_close(service);
+                        return -BFDEV_ENOERR;
+                    }
+
                     retval = shell_write(shell, data, size);
                     if (bfdev_unlikely(retval < 0))
                         return retval;
@@ -1600,6 +1798,17 @@ service_shell_write(struct sdbd_service *service, void *data, size_t length)
                 break;
 
             case SHELL_CMD_CLOSE:
+                if (bfdev_unlikely(size)) {
+                    bfdev_log_warn("shell write: close payload is not empty\n");
+                    service_shell_close(service);
+                    return -BFDEV_ENOERR;
+                }
+
+                retval = service_shell_stdin_close(shell);
+                if (bfdev_unlikely(retval < 0))
+                    return retval;
+                continue;
+
             default:
                 service_shell_close(service);
                 return -BFDEV_ENOERR;
@@ -1623,25 +1832,33 @@ service_shell_handle(bfenv_eproc_event_t *event, void *pdata)
     struct shell_data shellmsg;
     uint8_t buffer[MAX_PAYLOAD];
     ssize_t length;
+    bool terminal;
     int retval;
 
-    /* shell exit */
     shell = pdata;
-    if (bfenv_eproc_error_test(&event->events)) {
-        bfdev_log_info("shell handled: disconnected\n");
-        service_shell_close(&shell->service);
-        return -BFDEV_ENOERR;
+    terminal = bfenv_eproc_eof_test(&event->events) ||
+        bfenv_eproc_error_test(&event->events);
+    length = read(event->fd, buffer, shell->service.sctx->max_payload);
+    if (length <= 0) {
+        if (length < 0 && errno == EINTR)
+            return -BFDEV_ENOERR;
+
+        if (length < 0 && errno == EAGAIN &&
+            !bfenv_eproc_eof_test(&event->events) &&
+            !bfenv_eproc_error_test(&event->events))
+            return -BFDEV_ENOERR;
+
+        bfdev_log_info("shell handled: output closed\n");
+        return service_shell_output_close(shell, event);
     }
 
-    length = read(event->fd, buffer, shell->service.sctx->max_payload);
-    if (length <= 0)
-        return -BFDEV_EIO;
-
     if (!shell->v2) {
-        retval = send_data_async(shell->service.sctx, shell->service.local,
-            shell->service.remote, buffer, length);
+        retval = service_shell_send_data(shell, buffer, length);
         if (bfdev_unlikely(retval < 0))
             return retval;
+
+        if (terminal)
+            bfenv_eproc_event_raise(shell->service.sctx->eproc, event);
 
         return -BFDEV_ENOERR;
     }
@@ -1650,15 +1867,16 @@ service_shell_handle(bfenv_eproc_event_t *event, void *pdata)
         SHELL_CMD_STDERR : SHELL_CMD_STDOUT;
     shellmsg.size = bfdev_cpu_to_le32(length);
 
-    retval = send_data_async(shell->service.sctx, shell->service.local,
-        shell->service.remote, &shellmsg, sizeof(shellmsg));
+    retval = service_shell_send_data(shell, &shellmsg, sizeof(shellmsg));
     if (bfdev_unlikely(retval < 0))
         return retval;
 
-    retval = send_data_async(shell->service.sctx, shell->service.local,
-        shell->service.remote, buffer, length);
+    retval = service_shell_send_data(shell, buffer, length);
     if (bfdev_unlikely(retval < 0))
         return retval;
+
+    if (terminal)
+        bfenv_eproc_event_raise(shell->service.sctx->eproc, event);
 
     return -BFDEV_ENOERR;
 }
@@ -1667,7 +1885,6 @@ static struct sdbd_service *
 service_shell_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
 {
     struct sdbd_shell_service *shell;
-    struct sdbd_service **psrv;
     int retval;
 
     bfdev_log_notice("shell open: cmdline '%s'\n", cmdline);
@@ -1677,6 +1894,7 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
 
     shell->stdinout_fd = -1;
     shell->stderr_fd = -1;
+    shell->pidfd = -1;
 
     shell->protocol = SHELL_NONE;
     shell->type = cmdline ? SHELL_PTY : SHELL_RAW;
@@ -1730,6 +1948,7 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
     shell->service.remote = sctx->args[0];
     shell->service.local = ++sctx->sockid;
     shell->service.write = service_shell_write;
+    shell->service.okay = service_shell_okay;
     shell->service.close = service_shell_close;
     shell->escape_state = ESCAPE_NORM;
     bfdev_array_init(&shell->escape_buff, NULL, sizeof(uint8_t));
@@ -1738,6 +1957,20 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
     shell->pid = spawn_shell(shell, cmdline);
     if (bfdev_unlikely(shell->pid < 0))
         return BFDEV_ERR_PTR(-BFDEV_EFAULT);
+
+    shell->pidfd = syscall(SYS_pidfd_open, shell->pid, 0);
+    if (bfdev_unlikely(shell->pidfd < 0))
+        return BFDEV_ERR_PTR(-BFDEV_EFAULT);
+
+    shell->child_ev.fd = shell->pidfd;
+    shell->child_ev.flags = BFENV_EPROC_READ;
+    shell->child_ev.priority = 100;
+    shell->child_ev.func = service_shell_child_handle;
+    shell->child_ev.pdata = shell;
+
+    retval = bfenv_eproc_event_add(sctx->eproc, &shell->child_ev);
+    if (bfdev_unlikely(retval < 0))
+        return BFDEV_ERR_PTR(retval);
 
     shell->stdinout_ev.fd = shell->stdinout_fd;
     shell->stdinout_ev.flags = BFENV_EPROC_READ;
@@ -1759,10 +1992,7 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
             return BFDEV_ERR_PTR(retval);
     }
 
-    psrv = bfdev_radix_alloc(&sctx->services, sctx->sockid);
-    if (bfdev_unlikely(!psrv))
-        return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
-    *psrv = &shell->service;
+    bfdev_list_add(&sctx->services, &shell->service.list);
 
     return &shell->service;
 }
@@ -2690,7 +2920,6 @@ static struct sdbd_service *
 service_sync_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
 {
     struct sdbd_sync_service *sync;
-    struct sdbd_service **psrv;
     size_t slots, batch;
     int retval;
 
@@ -2725,10 +2954,7 @@ service_sync_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
         return BFDEV_ERR_PTR(-BFDEV_EFAULT);
     }
 
-    psrv = bfdev_radix_alloc(&sctx->services, sctx->sockid);
-    if (bfdev_unlikely(!psrv))
-        return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
-    *psrv = &sync->service;
+    bfdev_list_add(&sctx->services, &sync->service.list);
 
     return &sync->service;
 }
@@ -2867,7 +3093,6 @@ static struct sdbd_service *
 service_tcp_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
 {
     struct sdbd_tcp_service *tcp;
-    struct sdbd_service **psrv;
     int port, retval;
 
     tcp = bfdev_zalloc(NULL, sizeof(*tcp));
@@ -2911,10 +3136,7 @@ service_tcp_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
         return BFDEV_ERR_PTR(-BFDEV_EFAULT);
     }
 
-    psrv = bfdev_radix_alloc(&sctx->services, sctx->sockid);
-    if (bfdev_unlikely(!psrv))
-        return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
-    *psrv = &tcp->service;
+    bfdev_list_add(&sctx->services, &tcp->service.list);
 
     return &tcp->service;
 }
@@ -3120,18 +3342,17 @@ service_open(struct sdbd_ctx *sctx, char *cmdline)
 static int
 service_write(struct sdbd_ctx *sctx, uint8_t *payload)
 {
-    struct sdbd_service *service, **psrv;
+    struct sdbd_service *service;
     uint32_t local, remote;
     int retval;
 
     local = sctx->args[1];
-    psrv = bfdev_radix_find(&sctx->services, local);
-    if (bfdev_unlikely(!psrv)) {
+    service = service_find(sctx, local);
+    if (bfdev_unlikely(!service)) {
         bfdev_log_info("service write: failed connect to %d\n", local);
         return -BFDEV_ENOERR;
     }
 
-    service = *psrv;
     remote = service->remote;
 
     retval = service_kick(service);
@@ -3153,21 +3374,23 @@ service_write(struct sdbd_ctx *sctx, uint8_t *payload)
 static int
 service_okay(struct sdbd_ctx *sctx)
 {
-    struct sdbd_service *service, **psrv;
+    struct sdbd_service *service;
     uint32_t local;
     int retval;
 
     local = sctx->args[1];
-    psrv = bfdev_radix_find(&sctx->services, local);
-    if (bfdev_unlikely(!psrv) ){
+    service = service_find(sctx, local);
+    if (bfdev_unlikely(!service)) {
         bfdev_log_info("service okay: failed connect to %d\n", local);
         return -BFDEV_ENOERR;
     }
 
-    service = *psrv;
     retval = service_kick(service);
     if (bfdev_unlikely(retval < 0))
         return retval;
+
+    if (service->okay)
+        return service->okay(service);
 
     return -BFDEV_ENOERR;
 }
@@ -3175,31 +3398,27 @@ service_okay(struct sdbd_ctx *sctx)
 static void
 service_close(struct sdbd_ctx *sctx)
 {
-    struct sdbd_service *service, **psrv;
+    struct sdbd_service *service;
     uint32_t local;
 
     local = sctx->args[1];
-    psrv = bfdev_radix_find(&sctx->services, local);
-    if (bfdev_unlikely(!psrv)) {
+    service = service_find(sctx, local);
+    if (bfdev_unlikely(!service)) {
         bfdev_log_debug("service close: already close\n");
         return;
     }
 
-    service = *psrv;
     service->close(service);
 }
 
 static void
 service_close_all(struct sdbd_ctx *sctx)
 {
-    struct sdbd_service *service, **psrv;
-    uintptr_t offset;
+    struct sdbd_service *service, *tmp;
 
     bfdev_log_debug("service close all\n");
-    bfdev_radix_for_each(psrv, &sctx->services, &offset) {
-        service = *psrv;
+    bfdev_list_for_each_entry_safe(service, tmp, &sctx->services, list)
         service->close(service);
-    }
 }
 
 static int
@@ -3522,8 +3741,7 @@ sdbd_signal_handle(bfenv_eproc_event_t *event, void *pdata)
 
     switch (si.ssi_signo) {
         case SIGCHLD:
-            bfdev_log_debug("signal handled: release childrens\n");
-            waitpid(-1, NULL, WNOHANG);
+            bfdev_log_debug("signal handled: child status changed\n");
             break;
 
         case SIGUSR1:
@@ -3813,7 +4031,7 @@ sdbd(void)
     int retval;
 
     bzero(&sctx, sizeof(sctx));
-    sctx.services = BFDEV_RADIX_INIT(&sctx.services, NULL);
+    bfdev_list_head_init(&sctx.services);
     sctx.version = ADB_VERSION;
     sctx.max_payload = MAX_PAYLOAD;
 
@@ -3880,7 +4098,6 @@ sdbd(void)
 
 finish:
     service_close_all(&sctx);
-    bfdev_radix_release(&sctx.services);
 
     usb_close(&sctx);
     bfenv_eproc_destory(sctx.eproc);
